@@ -81,6 +81,39 @@ def file_mtime(path):
     t = datetime.fromtimestamp(os.stat(path).st_mtime, timezone.utc)
     return t.astimezone().isoformat()
 
+def download(crate, version):
+    if version is None:
+        # Now we need to get latest version
+        url = requests.compat.urljoin(API_URL, "crates/{}/versions".format(crate))
+        req = requests.get(url)
+        req.raise_for_status()
+        versions = req.json()["versions"]
+        version = next(version["num"] for version in versions if not version["yanked"])
+
+    if not os.path.isdir(CACHEDIR):
+        os.mkdir(CACHEDIR)
+    cratef_base = "{}-{}.crate".format(crate, version)
+    cratef = os.path.join(CACHEDIR, cratef_base)
+    if not os.path.isfile(cratef):
+        url = requests.compat.urljoin(API_URL, "crates/{}/{}/download#".format(crate, version))
+        req = requests.get(url, stream=True)
+        req.raise_for_status()
+        total = int(req.headers["Content-Length"])
+        with open(cratef, "wb") as f:
+            for chunk in tqdm.tqdm(req.iter_content(), "Downloading {}".format(cratef_base),
+                                   total=total, unit="B", unit_scale=True):
+                f.write(chunk)
+    return cratef, crate, version
+
+def local(crate, version):
+    if version != None:
+        raise Exception("Don't specify version when using local crates!")
+    assert os.path.isfile(crate)
+    assert crate.endswith('.crate')
+    cratename,version = os.path.basename(crate)[0:-6].rsplit('-', 1)
+    cratef = crate
+    return cratef, cratename, version
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-", "--stdout", action="store_true",
@@ -97,27 +130,10 @@ def main():
     if args.patch:
         editor = detect_editor()
 
-    if args.version is None:
-        # Now we need to get latest version
-        url = requests.compat.urljoin(API_URL, "crates/{}/versions".format(args.crate))
-        req = requests.get(url)
-        req.raise_for_status()
-        versions = req.json()["versions"]
-        args.version = next(version["num"] for version in versions if not version["yanked"])
-
-    if not os.path.isdir(CACHEDIR):
-        os.mkdir(CACHEDIR)
-    cratef_base = "{}-{}.crate".format(args.crate, args.version)
-    cratef = os.path.join(CACHEDIR, cratef_base)
-    if not os.path.isfile(cratef):
-        url = requests.compat.urljoin(API_URL, "crates/{}/{}/download#".format(args.crate, args.version))
-        req = requests.get(url, stream=True)
-        req.raise_for_status()
-        total = int(req.headers["Content-Length"])
-        with open(cratef, "wb") as f:
-            for chunk in tqdm.tqdm(req.iter_content(), "Downloading {}".format(cratef_base),
-                                   total=total, unit="B", unit_scale=True):
-                f.write(chunk)
+    if os.path.isfile(args.crate) and args.crate.endswith('.crate'):
+        cratef,crate,version = local(args.crate, args.version)
+    else:
+        cratef,crate,version = download(args.crate, args.version)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         target_dir = "{}/".format(tmpdir)
@@ -126,7 +142,7 @@ def main():
                 if not os.path.abspath(os.path.join(target_dir, n)).startswith(target_dir):
                     raise Exception("Unsafe filenames!")
             archive.extractall(target_dir)
-        toml_relpath = "{}-{}/Cargo.toml".format(args.crate, args.version)
+        toml_relpath = "{}-{}/Cargo.toml".format(crate, version)
         toml = "{}/{}".format(tmpdir, toml_relpath)
         assert os.path.isfile(toml)
 
@@ -147,7 +163,7 @@ def main():
     template = JINJA_ENV.get_template("main.spec")
 
     if args.patch and len(diff) > 0:
-        patch_file = "{}-{}-fix-metadata.diff".format(args.crate, args.version)
+        patch_file = "{}-{}-fix-metadata.diff".format(crate, version)
     else:
         patch_file = None
 
@@ -193,7 +209,7 @@ def main():
         kwargs["date"] = time.strftime("%a %b %d %Y")
     kwargs["packager"] = detect_packager()
 
-    spec_file = "rust-{}.spec".format(args.crate)
+    spec_file = "rust-{}.spec".format(crate)
     spec_contents = template.render(md=metadata, patch_file=patch_file, **kwargs)
     if args.stdout:
         print("# {}".format(spec_file))
